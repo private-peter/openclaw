@@ -212,6 +212,34 @@ describe("chunkMarkdownText", () => {
 
   runChunkCases(chunkMarkdownText, parentheticalCases);
 
+  it.each([
+    {
+      name: "list",
+      block: "(\n- item one\n- item two\n)",
+      limit: 30,
+    },
+    {
+      name: "blockquote",
+      block: "(\n> line one\n> line two\n)",
+      limit: 30,
+    },
+    {
+      name: "fenced code",
+      block: "(\n```js\nx()\n```\n)",
+      limit: 24,
+    },
+    {
+      name: "table",
+      block: "(\n| a |\n| - |\n| 1 |\n)",
+      limit: 28,
+    },
+  ])("keeps a parenthesized $name markdown block together", ({ block, limit }) => {
+    const text = `Intro ${block} tail and more words`;
+    const chunks = chunkMarkdownText(text, limit);
+
+    expect(chunks.some((chunk) => chunk.includes(block))).toBe(true);
+  });
+
   it("hard-breaks when a parenthetical exceeds the limit", () => {
     const text = `(${"a".repeat(80)})`;
     const chunks = chunkMarkdownText(text, 20);
@@ -387,6 +415,41 @@ describe("chunkMarkdownTextWithMode", () => {
         testCase.name,
       ).toEqual(testCase.expected);
     }
+  });
+
+  it("keeps a nested list block together in length mode when it fits in the next chunk", () => {
+    const prefix = "x".repeat(30);
+    const list = "- top level\n  - Sub level\n  - Another sub level\n- back to top level";
+
+    expect(chunkMarkdownTextWithMode(`${prefix}\n${list}`, 75, "length")).toEqual([prefix, list]);
+  });
+
+  it("keeps a nested list block together in newline mode when it fits in the next chunk", () => {
+    const prefix = "x".repeat(30);
+    const list = "- top level\n  - Sub level\n  - Another sub level\n- back to top level";
+
+    expect(chunkMarkdownTextWithMode(`${prefix}\n${list}`, 75, "newline")).toEqual([prefix, list]);
+  });
+
+  it("keeps a blockquote block together in length mode when it fits in the next chunk", () => {
+    const prefix = "x".repeat(30);
+    const quote = "> quoted line one\n> quoted line two";
+
+    expect(chunkMarkdownTextWithMode(`${prefix}\n${quote}`, 55, "length")).toEqual([prefix, quote]);
+  });
+
+  it("keeps a fenced code block together in length mode when it fits in the next chunk", () => {
+    const prefix = "x".repeat(30);
+    const fence = "```js\nconst a = 1;\nconst b = 2;\n```";
+
+    expect(chunkMarkdownTextWithMode(`${prefix}\n${fence}`, 55, "length")).toEqual([prefix, fence]);
+  });
+
+  it("keeps a table block together in length mode when it fits in the next chunk", () => {
+    const prefix = "x".repeat(30);
+    const table = "| a | b |\n| - | - |\n| 1 | 2 |";
+
+    expect(chunkMarkdownTextWithMode(`${prefix}\n${table}`, 50, "length")).toEqual([prefix, table]);
   });
 });
 

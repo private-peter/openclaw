@@ -1,4 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { chunkMarkdownTextWithMode as actualChunkMarkdownTextWithMode } from "../../../../src/auto-reply/chunk.js";
 import type { PluginRuntime } from "../../runtime-api.js";
 
 const loadWebMediaMock = vi.fn().mockResolvedValue({
@@ -14,9 +15,23 @@ const mediaKindFromMimeMock = vi.fn((_: string | null | undefined) => "image");
 const isVoiceCompatibleAudioMock = vi.fn(
   (_: { contentType?: string | null; fileName?: string | null }) => false,
 );
+const resolveChunkModeMock = vi.fn<
+  (cfg: unknown, channel: unknown, accountId?: unknown) => "length" | "newline"
+>(() => "length");
+const chunkMarkdownTextWithModeMock = vi.fn<
+  (text: string, limit: number, mode: "length" | "newline") => string[]
+>((text: string) => (text ? [text] : []));
 const resolveTextChunkLimitMock = vi.fn<
   (cfg: unknown, channel: unknown, accountId?: unknown) => number
 >(() => 4000);
+const nestedListHtmlPattern =
+  /<ul>\s*<li>top level\s*<ul>\s*<li>Sub level<\/li>\s*<li>Another sub level<\/li>\s*<\/ul>\s*<\/li>\s*<li>back to top level<\/li>\s*<\/ul>/;
+
+function getFormattedBodies(sendMessage: ReturnType<typeof vi.fn>): string[] {
+  return sendMessage.mock.calls
+    .map(([, content]) => (content as { formatted_body?: string }).formatted_body)
+    .filter((formattedBody): formattedBody is string => typeof formattedBody === "string");
+}
 
 const runtimeStub = {
   config: {
@@ -34,9 +49,11 @@ const runtimeStub = {
     text: {
       resolveTextChunkLimit: (cfg: unknown, channel: unknown, accountId?: unknown) =>
         resolveTextChunkLimitMock(cfg, channel, accountId),
-      resolveChunkMode: () => "length",
+      resolveChunkMode: (cfg: unknown, channel: unknown, accountId?: unknown) =>
+        resolveChunkModeMock(cfg, channel, accountId),
       chunkMarkdownText: (text: string) => (text ? [text] : []),
-      chunkMarkdownTextWithMode: (text: string) => (text ? [text] : []),
+      chunkMarkdownTextWithMode: (text: string, limit: number, mode: "length" | "newline") =>
+        chunkMarkdownTextWithModeMock(text, limit, mode),
       resolveMarkdownTableMode: () => "code",
       convertMarkdownTables: (text: string) => text,
     },
@@ -106,6 +123,11 @@ async function resetMatrixSendRuntimeMocks() {
   loadConfigMock.mockReset().mockReturnValue({});
   mediaKindFromMimeMock.mockReset().mockReturnValue("image");
   isVoiceCompatibleAudioMock.mockReset().mockReturnValue(false);
+  resolveChunkModeMock.mockReset().mockReturnValue("length");
+  chunkMarkdownTextWithModeMock
+    .mockReset()
+    .mockImplementation((text: string) => (text ? [text] : []));
+  resolveTextChunkLimitMock.mockReset().mockReturnValue(4000);
   await loadMatrixSendModules();
 }
 
@@ -126,6 +148,10 @@ describe("sendMessageMatrix media", () => {
     resizeToJpegMock.mockReset();
     mediaKindFromMimeMock.mockReset().mockReturnValue("image");
     isVoiceCompatibleAudioMock.mockReset().mockReturnValue(false);
+    resolveChunkModeMock.mockReset().mockReturnValue("length");
+    chunkMarkdownTextWithModeMock
+      .mockReset()
+      .mockImplementation((text: string) => (text ? [text] : []));
     resolveTextChunkLimitMock.mockReset().mockReturnValue(4000);
     await loadMatrixSendModules();
   });
@@ -369,6 +395,60 @@ describe("sendMessageMatrix threads", () => {
   });
 });
 
+describe("sendMessageMatrix nested markdown lists", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    loadConfigMock.mockReset().mockReturnValue({});
+    mediaKindFromMimeMock.mockReset().mockReturnValue("image");
+    isVoiceCompatibleAudioMock.mockReset().mockReturnValue(false);
+    resolveChunkModeMock.mockReset().mockReturnValue("length");
+    chunkMarkdownTextWithModeMock
+      .mockReset()
+      .mockImplementation((text: string, limit: number, mode: "length" | "newline") =>
+        actualChunkMarkdownTextWithMode(text, limit, mode),
+      );
+    resolveTextChunkLimitMock.mockReset().mockReturnValue(4000);
+    await loadMatrixSendModules();
+  });
+
+  for (const mode of ["length", "newline"] as const) {
+    it(`keeps a nested list together in one rendered chunk for text sends (${mode})`, async () => {
+      const { client, sendMessage } = makeClient();
+      const prefix = "x".repeat(30);
+      const list = "- top level\n  - Sub level\n  - Another sub level\n- back to top level";
+      resolveChunkModeMock.mockReturnValue(mode);
+      resolveTextChunkLimitMock.mockReturnValue(75);
+
+      await sendMessageMatrix("room:!room:example", `${prefix}\n${list}`, {
+        client,
+      });
+
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+      expect(getFormattedBodies(sendMessage)).toContainEqual(
+        expect.stringMatching(nestedListHtmlPattern),
+      );
+    });
+
+    it(`keeps a nested list together in one rendered follow-up chunk for media sends (${mode})`, async () => {
+      const { client, sendMessage } = makeClient();
+      const prefix = "x".repeat(30);
+      const list = "- top level\n  - Sub level\n  - Another sub level\n- back to top level";
+      resolveChunkModeMock.mockReturnValue(mode);
+      resolveTextChunkLimitMock.mockReturnValue(75);
+
+      await sendMessageMatrix("room:!room:example", `${prefix}\n${list}`, {
+        client,
+        mediaUrl: "file:///tmp/photo.png",
+      });
+
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+      expect(getFormattedBodies(sendMessage)).toContainEqual(
+        expect.stringMatching(nestedListHtmlPattern),
+      );
+    });
+  }
+});
+
 describe("voteMatrixPoll", () => {
   beforeAll(async () => {
     await loadMatrixSendModules();
@@ -521,6 +601,10 @@ describe("sendTypingMatrix", () => {
     loadConfigMock.mockReset().mockReturnValue({});
     mediaKindFromMimeMock.mockReset().mockReturnValue("image");
     isVoiceCompatibleAudioMock.mockReset().mockReturnValue(false);
+    resolveChunkModeMock.mockReset().mockReturnValue("length");
+    chunkMarkdownTextWithModeMock
+      .mockReset()
+      .mockImplementation((text: string) => (text ? [text] : []));
     await loadMatrixSendModules();
   });
 

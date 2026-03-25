@@ -2,6 +2,7 @@
 // unintentionally breaking on newlines. Using [\s\S] keeps newlines inside
 // the chunk so messages are only split when they truly exceed the limit.
 
+import MarkdownIt from "markdown-it";
 import type { ChannelId } from "../channels/plugins/types.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { findFenceSpanAt, isSafeFenceBreak, parseFenceSpans } from "../markdown/fences.js";
@@ -23,6 +24,12 @@ export type ChunkMode = "length" | "newline";
 
 const DEFAULT_CHUNK_LIMIT = 4000;
 const DEFAULT_CHUNK_MODE: ChunkMode = "length";
+const markdownChunkParser = new MarkdownIt({
+  html: false,
+  linkify: false,
+  breaks: false,
+  typographer: false,
+});
 
 type ProviderChunkConfig = {
   textChunkLimit?: number;
@@ -306,7 +313,12 @@ export function chunkText(text: string, limit: number): string[] {
   }
   return chunkTextByBreakResolver(text, limit, (window) => {
     // 1) Prefer a newline break inside the window (outside parentheses).
-    const { lastNewline, lastWhitespace } = scanParenAwareBreakpoints(window, 0, window.length);
+    const { newlineCandidates, lastWhitespace } = scanParenAwareBreakpoints(
+      window,
+      0,
+      window.length,
+    );
+    const lastNewline = newlineCandidates.at(-1) ?? -1;
     // 2) Otherwise prefer the last whitespace (word boundary) inside the window.
     return lastNewline > 0 ? lastNewline : lastWhitespace;
   });
@@ -320,6 +332,7 @@ export function chunkMarkdownText(text: string, limit: number): string[] {
 
   const chunks: string[] = [];
   const spans = parseFenceSpans(text);
+  const markdownBreakHints = getMarkdownSafeBreakIndices(text);
   let start = 0;
   let reopenFence: ReturnType<typeof findFenceSpanAt> | undefined;
 
@@ -335,7 +348,7 @@ export function chunkMarkdownText(text: string, limit: number): string[] {
     }
 
     const windowEnd = Math.min(text.length, start + contentLimit);
-    const softBreak = pickSafeBreakIndex(text, start, windowEnd, spans);
+    const softBreak = pickSafeBreakIndex(text, start, windowEnd, spans, markdownBreakHints);
     let breakIdx = softBreak > start ? softBreak : windowEnd;
 
     const initialFence = isSafeFenceBreak(spans, breakIdx)
@@ -425,11 +438,29 @@ function pickSafeBreakIndex(
   start: number,
   end: number,
   spans: ReturnType<typeof parseFenceSpans>,
+  markdownBreakHints: readonly number[],
 ): number {
-  const { lastNewline, lastWhitespace } = scanParenAwareBreakpoints(text, start, end, (index) =>
-    isSafeFenceBreak(spans, index),
+  const { newlineCandidates, lastWhitespace } = scanParenAwareBreakpoints(
+    text,
+    start,
+    end,
+    (index) => isSafeFenceBreak(spans, index),
   );
+  const parenSafeNewlines = new Set(newlineCandidates);
 
+  for (let i = markdownBreakHints.length - 1; i >= 0; i--) {
+    const breakIdx = markdownBreakHints[i];
+    if (breakIdx <= start) {
+      break;
+    }
+    // Markdown block hints are only safe if they also satisfy the existing
+    // parenthesis-aware newline guard for this window.
+    if (breakIdx < end && parenSafeNewlines.has(breakIdx)) {
+      return breakIdx;
+    }
+  }
+
+  const lastNewline = newlineCandidates.at(-1) ?? -1;
   if (lastNewline > start) {
     return lastNewline;
   }
@@ -444,8 +475,8 @@ function scanParenAwareBreakpoints(
   start: number,
   end: number,
   isAllowed: (index: number) => boolean = () => true,
-): { lastNewline: number; lastWhitespace: number } {
-  let lastNewline = -1;
+): { newlineCandidates: number[]; lastWhitespace: number } {
+  const newlineCandidates: number[] = [];
   let lastWhitespace = -1;
   let depth = 0;
 
@@ -466,11 +497,64 @@ function scanParenAwareBreakpoints(
       continue;
     }
     if (char === "\n") {
-      lastNewline = i;
+      newlineCandidates.push(i);
     } else if (/\s/.test(char)) {
       lastWhitespace = i;
     }
   }
 
-  return { lastNewline, lastWhitespace };
+  return { newlineCandidates, lastWhitespace };
+}
+
+type MarkdownBlockToken = {
+  type: string;
+  level: number;
+  nesting: number;
+  map?: [number, number] | null;
+};
+
+function getMarkdownSafeBreakIndices(text: string): number[] {
+  if (!text.includes("\n")) {
+    return [];
+  }
+  const tokens = markdownChunkParser.parse(text, {}) as MarkdownBlockToken[];
+  const lineStarts = getLineStartOffsets(text);
+  const breakIndices = new Set<number>();
+
+  for (const token of tokens) {
+    if (!isMarkdownStandaloneBoundaryToken(token)) {
+      continue;
+    }
+    const [startLine] = token.map ?? [];
+    if (!startLine || startLine >= lineStarts.length) {
+      continue;
+    }
+    const lineStart = lineStarts[startLine];
+    if (lineStart <= 0) {
+      continue;
+    }
+    breakIndices.add(lineStart - 1);
+  }
+
+  return [...breakIndices].toSorted((a, b) => a - b);
+}
+
+function isMarkdownStandaloneBoundaryToken(token: MarkdownBlockToken): boolean {
+  if (!token.map || token.type.endsWith("_close")) {
+    return false;
+  }
+  if (token.level === 0) {
+    return token.nesting >= 0;
+  }
+  return token.type === "list_item_open" && token.level === 1;
+}
+
+function getLineStartOffsets(text: string): number[] {
+  const offsets = [0];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\n") {
+      offsets.push(i + 1);
+    }
+  }
+  return offsets;
 }
